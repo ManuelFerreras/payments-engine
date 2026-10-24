@@ -1,0 +1,15 @@
+﻿Type, Client, Tx, Amount,
+Deposit, 1, 10, 100.0,
+Deposit, 2, 20, 50.0,
+
+WITHDRAWAL, 1, 11, 30.0,
+Dispute, 1, 10,
+resolve, 1, 10,
+   
+WITHDRAWAL, 2, 21, 80.0,
+deposit,3,30,1.0,extra,
+depositt, 3, 31, 5.0,
+Deposit, 3, 32, 7.5,
+Dispute, 2, 20,
+ChargeBack, 2, 20,
+Deposit, 2, 22, 1.0,
