@@ -66,6 +66,11 @@ impl Money {
     pub fn checked_sub(self, other: Money) -> Option<Money> {
         self.0.checked_sub(other.0).map(Money)
     }
+
+    // Only for the derived total, whose checked sum the account already guards.
+    pub fn saturating_add(self, other: Money) -> Money {
+        Money(self.0.saturating_add(other.0))
+    }
 }
 
 impl Amount {
