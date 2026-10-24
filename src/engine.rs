@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::{ClientId, TxId};
+
 // The row parsed fine and the bank says no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RejectReason {
@@ -8,17 +10,21 @@ pub enum RejectReason {
     #[error("insufficient available funds")]
     InsufficientFunds,
     #[error("tx {0} already exists")]
-    DuplicateTx(u32),
+    DuplicateTx(TxId),
     #[error("tx {0} is not a known deposit")]
-    UnknownTx(u32),
+    UnknownTx(TxId),
     #[error("tx {tx} belongs to client {owner}, not client {claimed}")]
-    ClientMismatch { tx: u32, owner: u16, claimed: u16 },
+    ClientMismatch {
+        tx: TxId,
+        owner: ClientId,
+        claimed: ClientId,
+    },
     #[error("tx {0} is already under dispute")]
-    AlreadyDisputed(u32),
+    AlreadyDisputed(TxId),
     #[error("tx {0} is not under dispute")]
-    NotDisputed(u32),
+    NotDisputed(TxId),
     #[error("tx {0} was already charged back")]
-    AlreadyChargedBack(u32),
+    AlreadyChargedBack(TxId),
     #[error("balance would overflow")]
     Overflow,
 }
