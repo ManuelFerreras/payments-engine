@@ -30,13 +30,22 @@ enum DisputeState {
     ChargedBack,
 }
 
+// The three kinds that reference an earlier deposit, so the state machine
+// below is a match on (Reference, DisputeState) with exactly nine arms.
+#[derive(Debug, Clone, Copy)]
+enum Reference {
+    Dispute,
+    Resolve,
+    Chargeback,
+}
+
 impl Engine {
     pub fn new() -> Engine {
         Engine::default()
     }
 
     pub fn apply(&mut self, tx: Transaction) -> Result<(), RejectReason> {
-        match tx.kind {
+        let reference = match tx.kind {
             Kind::Deposit(amount) => {
                 // The duplicate check runs before the accounts map is touched,
                 // so a duplicate from a new client creates nothing.
@@ -55,7 +64,7 @@ impl Engine {
                         state: DisputeState::Undisputed,
                     },
                 );
-                Ok(())
+                return Ok(());
             }
             Kind::Withdrawal(amount) => {
                 if self.deposits.contains_key(&tx.tx) {
@@ -65,9 +74,71 @@ impl Engine {
                 // exists even when the withdrawal then fails. Withdrawal ids
                 // are not stored, the input guarantees uniqueness.
                 let account = self.accounts.entry(tx.client).or_default();
-                account.withdraw(amount)
+                return account.withdraw(amount);
             }
-            Kind::Dispute | Kind::Resolve | Kind::Chargeback => Err(RejectReason::UnknownTx(tx.tx)),
+            Kind::Dispute => Reference::Dispute,
+            Kind::Resolve => Reference::Resolve,
+            Kind::Chargeback => Reference::Chargeback,
+        };
+
+        // Reference rows never create accounts. The record borrow is on
+        // self.deposits and the account borrow on self.accounts, so they
+        // coexist in this body. The ok_or fallback is unreachable because
+        // the deposit that wrote the record also created the account.
+        let Some(record) = self.deposits.get_mut(&tx.tx) else {
+            return Err(RejectReason::UnknownTx(tx.tx));
+        };
+        if record.client != tx.client {
+            return Err(RejectReason::ClientMismatch {
+                tx: tx.tx,
+                owner: record.client,
+                claimed: tx.client,
+            });
+        }
+        match (reference, record.state) {
+            (Reference::Dispute, DisputeState::Undisputed) => {
+                let account = self
+                    .accounts
+                    .get_mut(&record.client)
+                    .ok_or(RejectReason::UnknownTx(tx.tx))?;
+                account.hold(record.amount)?;
+                record.state = DisputeState::Disputed;
+                Ok(())
+            }
+            (Reference::Dispute, DisputeState::Disputed) => {
+                Err(RejectReason::AlreadyDisputed(tx.tx))
+            }
+            (Reference::Dispute, DisputeState::ChargedBack) => {
+                Err(RejectReason::AlreadyChargedBack(tx.tx))
+            }
+            (Reference::Resolve, DisputeState::Undisputed) => Err(RejectReason::NotDisputed(tx.tx)),
+            (Reference::Resolve, DisputeState::Disputed) => {
+                let account = self
+                    .accounts
+                    .get_mut(&record.client)
+                    .ok_or(RejectReason::UnknownTx(tx.tx))?;
+                account.release(record.amount)?;
+                record.state = DisputeState::Undisputed;
+                Ok(())
+            }
+            (Reference::Resolve, DisputeState::ChargedBack) => {
+                Err(RejectReason::AlreadyChargedBack(tx.tx))
+            }
+            (Reference::Chargeback, DisputeState::Undisputed) => {
+                Err(RejectReason::NotDisputed(tx.tx))
+            }
+            (Reference::Chargeback, DisputeState::Disputed) => {
+                let account = self
+                    .accounts
+                    .get_mut(&record.client)
+                    .ok_or(RejectReason::UnknownTx(tx.tx))?;
+                account.charge_back(record.amount)?;
+                record.state = DisputeState::ChargedBack;
+                Ok(())
+            }
+            (Reference::Chargeback, DisputeState::ChargedBack) => {
+                Err(RejectReason::AlreadyChargedBack(tx.tx))
+            }
         }
     }
 
@@ -171,5 +242,112 @@ mod tests {
         assert_eq!(result, Err(RejectReason::AccountLocked));
         assert!(engine.deposits.contains_key(&1));
         assert!(!engine.deposits.contains_key(&2));
+    }
+
+    fn reference(client: ClientId, tx: TxId, kind: Kind) -> Transaction {
+        Transaction { client, tx, kind }
+    }
+
+    fn balances(engine: &Engine, client: ClientId) -> (String, String, String, bool) {
+        let account = engine.account(client).unwrap();
+        (
+            account.available().to_string(),
+            account.held().to_string(),
+            account.total().to_string(),
+            account.is_locked(),
+        )
+    }
+
+    #[test]
+    fn a_dispute_from_the_wrong_client_is_rejected_and_changes_nothing() {
+        let mut engine = Engine::new();
+        engine.apply(deposit(1, 1, "10")).unwrap();
+        engine.apply(deposit(2, 2, "20")).unwrap();
+
+        let result = engine.apply(reference(2, 1, Kind::Dispute));
+
+        assert_eq!(
+            result,
+            Err(RejectReason::ClientMismatch {
+                tx: 1,
+                owner: 1,
+                claimed: 2
+            })
+        );
+        assert_eq!(
+            balances(&engine, 1),
+            ("10.0000".into(), "0.0000".into(), "10.0000".into(), false)
+        );
+        assert_eq!(
+            balances(&engine, 2),
+            ("20.0000".into(), "0.0000".into(), "20.0000".into(), false)
+        );
+        assert_eq!(engine.deposits[&1].state, DisputeState::Undisputed);
+    }
+
+    #[test]
+    fn a_resolve_returns_the_deposit_to_disputable() {
+        let mut engine = Engine::new();
+        engine.apply(deposit(1, 1, "10")).unwrap();
+        engine.apply(reference(1, 1, Kind::Dispute)).unwrap();
+        engine.apply(reference(1, 1, Kind::Resolve)).unwrap();
+
+        engine.apply(reference(1, 1, Kind::Dispute)).unwrap();
+
+        assert_eq!(
+            balances(&engine, 1),
+            ("0.0000".into(), "10.0000".into(), "10.0000".into(), false)
+        );
+        assert_eq!(engine.deposits[&1].state, DisputeState::Disputed);
+    }
+
+    #[test]
+    fn a_chargeback_is_terminal_for_all_three_reference_kinds() {
+        let mut engine = Engine::new();
+        engine.apply(deposit(1, 1, "10")).unwrap();
+        engine.apply(reference(1, 1, Kind::Dispute)).unwrap();
+        engine.apply(reference(1, 1, Kind::Chargeback)).unwrap();
+
+        assert_eq!(
+            engine.apply(reference(1, 1, Kind::Dispute)),
+            Err(RejectReason::AlreadyChargedBack(1))
+        );
+        assert_eq!(
+            engine.apply(reference(1, 1, Kind::Resolve)),
+            Err(RejectReason::AlreadyChargedBack(1))
+        );
+        assert_eq!(
+            engine.apply(reference(1, 1, Kind::Chargeback)),
+            Err(RejectReason::AlreadyChargedBack(1))
+        );
+        assert_eq!(
+            balances(&engine, 1),
+            ("0.0000".into(), "0.0000".into(), "0.0000".into(), true)
+        );
+    }
+
+    #[test]
+    fn a_dispute_on_a_locked_account_still_holds_and_a_resolve_still_releases() {
+        let mut engine = Engine::new();
+        engine.apply(deposit(1, 1, "100")).unwrap();
+        engine.apply(deposit(1, 2, "50")).unwrap();
+        engine.apply(reference(1, 1, Kind::Dispute)).unwrap();
+        engine.apply(reference(1, 1, Kind::Chargeback)).unwrap();
+        assert_eq!(
+            balances(&engine, 1),
+            ("50.0000".into(), "0.0000".into(), "50.0000".into(), true)
+        );
+
+        engine.apply(reference(1, 2, Kind::Dispute)).unwrap();
+        assert_eq!(
+            balances(&engine, 1),
+            ("0.0000".into(), "50.0000".into(), "50.0000".into(), true)
+        );
+
+        engine.apply(reference(1, 2, Kind::Resolve)).unwrap();
+        assert_eq!(
+            balances(&engine, 1),
+            ("50.0000".into(), "0.0000".into(), "50.0000".into(), true)
+        );
     }
 }
