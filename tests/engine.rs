@@ -348,9 +348,9 @@ fn unordered_client_and_tx_ids_are_applied_in_file_order_and_printed_in_client_o
     assert_conserved(rows, &engine, &rejections);
 }
 
-// Pins the match arm order in the engine: a dispute on a disputed deposit must
-// report AlreadyDisputed, never AlreadyChargedBack. Both arms are reachable,
-// so the compiler cannot catch a swap.
+// A dispute on a disputed deposit must report AlreadyDisputed, never
+// AlreadyChargedBack. With nine explicit arms the order cannot change that,
+// this pins the rule against a future catch all arm on ChargedBack.
 #[test]
 fn a_redispute_after_a_resolve_is_allowed_and_a_third_dispute_is_already_disputed() {
     let rows = "deposit,1,1,10.0\n\
