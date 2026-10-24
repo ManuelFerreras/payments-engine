@@ -83,8 +83,7 @@ impl Engine {
 
         // Reference rows never create accounts. The record borrow is on
         // self.deposits and the account borrow on self.accounts, so they
-        // coexist in this body. The ok_or fallback is unreachable because
-        // the deposit that wrote the record also created the account.
+        // coexist in this body.
         let Some(record) = self.deposits.get_mut(&tx.tx) else {
             return Err(RejectReason::UnknownTx(tx.tx));
         };
@@ -97,6 +96,7 @@ impl Engine {
         }
         match (reference, record.state) {
             (Reference::Dispute, DisputeState::Undisputed) => {
+                // The fallback cannot happen because the deposit that stored the record created the account.
                 let account = self
                     .accounts
                     .get_mut(&record.client)
